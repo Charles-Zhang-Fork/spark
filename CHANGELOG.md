@@ -1,3 +1,9 @@
+## Unreleased
+
+### Bug Fixes
+
+- Read SOG v3, the version splat-transform writes by default since 2.x and SuperSplat exports: rotations as the 24-bit exponential map, opacity as the square-root byte (capped at 1, since Spark reads opacity above 1 as its own level-of-detail encoding), and spherical-harmonic palette labels in 24 bits. v3 files were read as v2 before, which turned every rotation and drew the scene as needles. A SOG version Spark does not know is refused rather than misread.
+
 ## 2.4.0 (Oct 19, 2026)
 
 Bug fixes and improvements

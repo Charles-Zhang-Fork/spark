@@ -277,7 +277,13 @@ fn decode_v2<T: SplatReceiver>(
     splats: &mut T,
     images: &HashMap<String, ImageData>,
 ) -> anyhow::Result<()> {
-    let _ = meta.version;
+    // v3 (splat-transform 2.x and later) keeps v2's layout but stores rotations as a 24-bit exp map,
+    // opacity as a square-root byte and shN labels in 24 bits; anything newer is refused rather than misread
+    let v3 = match meta.version {
+        2 => false,
+        3 => true,
+        v => return Err(anyhow!("Unsupported SOG version {v}")),
+    };
     let _ = meta.means.shape;
     let num_splats = meta.count;
     let max_sh_degree = meta.shn.as_ref().map(|shn| {
@@ -291,18 +297,26 @@ fn decode_v2<T: SplatReceiver>(
     let quats_img = get_image(images, &meta.quats.files[0])?;
     let sh0_img = get_image(images, &meta.sh0.files[0])?;
     let shn = match meta.shn {
-        Some(shn) => Some(ShN::load(images, &shn.files, shn.codebook, max_sh_degree)?),
+        Some(shn) => Some(ShN::load(images, &shn.files, shn.codebook, max_sh_degree, v3)?),
         None => None,
     };
 
     let scale_lookup: Vec<f32> = meta.scales.codebook.iter().map(|v| v.exp()).collect();
     let rgb_lookup: Vec<f32> = meta.sh0.codebook.iter().map(|v| SH_C0 * v + 0.5).collect();
-    let a_lookup: Vec<f32> = (0..256).map(|i| i as f32 / 255.0).collect();
+    // v3 opacity is (b / 204)^2 and may reach 1.5625 where a level-of-detail merge owes more mass; Spark reads
+    // opacity above 1 as its own level-of-detail encoding, so it is capped at 1
+    let a_lookup: Vec<f32> = (0..256)
+        .map(|i| if v3 { ((i as f32 / 204.0).powi(2)).min(1.0) } else { i as f32 / 255.0 })
+        .collect();
 
     emit_chunks(splats, num_splats, max_sh_degree, |base, count, c| {
         decode_means(&meta.means.mins, &meta.means.maxs, means0, means1, base, &mut c.center[..count * 3]);
         decode_scales(&scale_lookup, &scale_lookup, &scale_lookup, scales_img, base, &mut c.scale[..count * 3]);
-        decode_quats(quats_img, base, &mut c.quat[..count * 4]);
+        if v3 {
+            decode_quats_expmap(quats_img, base, &mut c.quat[..count * 4]);
+        } else {
+            decode_quats(quats_img, base, &mut c.quat[..count * 4]);
+        }
         decode_sh0(&rgb_lookup, &rgb_lookup, &rgb_lookup, &a_lookup, sh0_img, base, &mut c.rgb[..count * 3], &mut c.opacity[..count]);
         if let Some(shn) = &shn {
             shn.decode(base, count, c);
@@ -346,7 +360,7 @@ fn decode_v1<T: SplatReceiver>(
             let lookup: Vec<f32> = (0..256)
                 .map(|i| shn.mins + (shn.maxs - shn.mins) * (i as f32 / 255.0))
                 .collect();
-            Some(ShN::load(images, &shn.files, lookup, max_sh_degree)?)
+            Some(ShN::load(images, &shn.files, lookup, max_sh_degree, false)?)
         }
         None => None,
     };
@@ -441,6 +455,26 @@ fn decode_quats(img: &ImageData, base: usize, out_quat: &mut [f32]) {
     }
 }
 
+/// SOG v3 rotations: p = (2/π)·θ·v/|v| (θ half the rotation angle, w >= 0), one byte per component on the
+/// lattice (b - 128) / 127, in RGB; as splat-transform's decodeQuatExpMap
+fn decode_quats_expmap(img: &ImageData, base: usize, out_quat: &mut [f32]) {
+    const HALF_PI: f32 = std::f32::consts::FRAC_PI_2;
+    let rgba = &img.rgba[base * 4..];
+    for i in 0..out_quat.len() / 4 {
+        let i4 = i * 4;
+        let px = (rgba[i4] as f32 - 128.0) / 127.0;
+        let py = (rgba[i4 + 1] as f32 - 128.0) / 127.0;
+        let pz = (rgba[i4 + 2] as f32 - 128.0) / 127.0;
+        let r = (px * px + py * py + pz * pz).sqrt();
+        let t = HALF_PI * r;
+        let k = if r > 1e-12 { t.sin() / r } else { HALF_PI };
+        out_quat[i4] = px * k;
+        out_quat[i4 + 1] = py * k;
+        out_quat[i4 + 2] = pz * k;
+        out_quat[i4 + 3] = t.cos();
+    }
+}
+
 fn decode_sh0(
     lr: &[f32],
     lg: &[f32],
@@ -468,6 +502,8 @@ struct ShN<'a> {
     labels: &'a ImageData,
     lookup: Vec<f32>,
     degree: usize,
+    // v3 labels are 24-bit (RGB), v2 16-bit (RG)
+    wide_labels: bool,
 }
 
 impl<'a> ShN<'a> {
@@ -476,10 +512,11 @@ impl<'a> ShN<'a> {
         files: &[String; 2],
         lookup: Vec<f32>,
         degree: usize,
+        wide_labels: bool,
     ) -> anyhow::Result<Self> {
         let centroids = get_image(images, &files[0])?;
         let labels = get_image(images, &files[1])?;
-        Ok(Self { centroids, labels, lookup, degree })
+        Ok(Self { centroids, labels, lookup, degree, wide_labels })
     }
 
     fn decode(&self, base: usize, count: usize, c: &mut Chunk) {
@@ -488,10 +525,20 @@ impl<'a> ShN<'a> {
         let stride = if self.degree >= 3 { 15 } else if self.degree >= 2 { 8 } else { 3 };
         for i in 0..count {
             let i4 = i * 4;
-            let label = labels[i4] as u16 | ((labels[i4 + 1] as u16) << 8);
+            let mut label = labels[i4] as u32 | ((labels[i4 + 1] as u32) << 8);
+            if self.wide_labels {
+                label |= (labels[i4 + 2] as u32) << 16;
+            }
             let col = (label & 63) as usize * stride;
             let row = (label >> 6) as usize;
             let offset = row * centroids.width + col;
+            // a label past the palette (or its texture) has no harmonics, as splat-transform reads it
+            if col + stride > centroids.width || (offset + stride) * 4 > centroids.rgba.len() {
+                if self.degree >= 1 { c.sh1[i * 9..i * 9 + 9].fill(0.0); }
+                if self.degree >= 2 { c.sh2[i * 15..i * 15 + 15].fill(0.0); }
+                if self.degree >= 3 { c.sh3[i * 21..i * 21 + 21].fill(0.0); }
+                continue;
+            }
             for d in 0..3 {
                 if self.degree >= 1 {
                     for k in 0..3 {
@@ -715,7 +762,7 @@ mod tests {
             ("ml.png", png(sy.ml.clone(), w, h)), ("mu.png", png(sy.mu.clone(), w, h)),
             ("s.png", png(sy.s.clone(), w, h)), ("q.png", png(sy.q.clone(), w, h)),
             ("c.png", png(sy.c.clone(), w, h)), ("lab.png", png(sy.lab.clone(), w, h)),
-            ("cent.png", png(sy.cent.clone(), CW as u32, CH as u32)),
+            ("cent.png", png(sy.cent.clone(), CW as u32, (sy.cent.len() / (CW * 4)) as u32)),
         ].into_iter().map(|(k, v)| (k.to_string(), v)).collect()
     }
 
@@ -762,6 +809,86 @@ mod tests {
         let sy = synth();
         let got = decode_zip(&sog_zip(&meta_v2(&sy), synth_files(&sy)));
         assert_same(&got, &reference(&sy, false));
+    }
+
+    /// v3 textures: as v2's, with labels reaching past 16 bits and a palette tall enough for them
+    const CH3: usize = ((1 << 16) + 1024) / 64 + 1;
+
+    fn synth_v3() -> Synth {
+        let mut sy = synth();
+        let mut rnd = xorshift(0x0bad_cafe);
+        sy.lab = (0..W * H * 4).map(|i| match i % 4 { 0 => rnd() as u8, 1 => (rnd() % 4) as u8, 2 => (rnd() % 2) as u8, _ => 255 }).collect();
+        sy.cent = (0..CW * CH3 * 4).map(|_| rnd() as u8).collect();
+        sy
+    }
+
+    /// Reference for v3: v2's formulas, with the exp-map rotation, the square-root opacity byte (capped at 1)
+    /// and 24-bit labels, written out as splat-transform's reader has them
+    fn reference_v3(sy: &Synth) -> Rec {
+        let mut r = reference(sy, false);
+        let half_pi = std::f64::consts::FRAC_PI_2;
+        for j in 0..N {
+            let p = j * 4;
+            let (px, py, pz) = ((sy.q[p] as f64 - 128.0) / 127.0, (sy.q[p + 1] as f64 - 128.0) / 127.0, (sy.q[p + 2] as f64 - 128.0) / 127.0);
+            let len = (px * px + py * py + pz * pz).sqrt();
+            let k = if len > 1e-12 { (half_pi * len).sin() / len } else { half_pi };
+            let quat = [(px * k) as f32, (py * k) as f32, (pz * k) as f32, (half_pi * len).cos() as f32];
+            r.quat[j * 4..j * 4 + 4].copy_from_slice(&quat);
+            let a = sy.c[p + 3] as f64 / 204.0;
+            r.opacity[j] = (a * a).min(1.0) as f32;
+            let label = sy.lab[p] as usize | ((sy.lab[p + 1] as usize) << 8) | ((sy.lab[p + 2] as usize) << 16);
+            let off = (label >> 6) * CW + (label & 63) * 15;
+            for (deg, (first, k)) in [(0, 3), (3, 5), (8, 7)].into_iter().enumerate() {
+                for kk in 0..k {
+                    for d in 0..3 {
+                        r.sh[deg][j * k * 3 + kk * 3 + d] = sy.cb[2][sy.cent[(off + first + kk) * 4 + d] as usize];
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    fn meta_v3(sy: &Synth) -> Vec<u8> {
+        let mut meta: serde_json::Value = serde_json::from_slice(&meta_v2(sy)).unwrap();
+        meta["version"] = 3.into();
+        // fields v3 adds that a renderer may pass over
+        meta["opacity"] = serde_json::json!({"max": 1.5625});
+        meta["asset"] = serde_json::json!({"generator": "test"});
+        meta.to_string().into_bytes()
+    }
+
+    #[test]
+    fn decode_v3_chunked_matches_reference() {
+        let sy = synth_v3();
+        assert_eq!(sy.cent.len(), CW * CH3 * 4);
+        let got = decode_zip(&sog_zip(&meta_v3(&sy), synth_files(&sy)));
+        assert!(sy.lab.chunks(4).any(|l| l[2] > 0), "labels past 16 bits are exercised");
+        assert_same(&got, &reference_v3(&sy));
+    }
+
+    #[test]
+    fn decode_v3_identity_rotation_is_exact() {
+        let mut img = ImageData { rgba: vec![128, 128, 128, 255], width: 1, height: 1 };
+        let mut q = [0.0f32; 4];
+        decode_quats_expmap(&img, 0, &mut q);
+        assert_eq!(q, [0.0, 0.0, 0.0, 1.0]);
+        // a half turn about x: p = (1, 0, 0), byte 255
+        img.rgba = vec![255, 128, 128, 255];
+        decode_quats_expmap(&img, 0, &mut q);
+        assert!((q[0] - 1.0).abs() < 1e-6 && q[3].abs() < 1e-6, "{q:?}");
+    }
+
+    #[test]
+    fn decode_refuses_unknown_versions() {
+        let sy = synth();
+        let mut meta: serde_json::Value = serde_json::from_slice(&meta_v2(&sy)).unwrap();
+        meta["version"] = 4.into();
+        let mut dec = SogsDecoder::new(Rec::default(), None);
+        let zbuf = sog_zip(meta.to_string().as_bytes(), synth_files(&sy));
+        let pushed = zbuf.chunks(100_000).try_for_each(|part| dec.push(part));
+        let err = pushed.and_then(|_| dec.finish()).expect_err("version 4 is refused");
+        assert!(format!("{err:#}").contains("Unsupported SOG version 4"), "{err:#}");
     }
 
     #[test]
